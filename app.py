@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import os
+import base64
 from datetime import datetime, timedelta
 from fubon_neo.sdk import FubonSDK
 
@@ -25,40 +26,35 @@ if not st.session_state.login_status:
     st.text_input("請輸入系統存取密碼：", type="password", key="password_input", on_change=check_login)
     st.stop()
 
-# --- 富邦 API 資安與連線區塊 ---
-st.sidebar.header("⚙️ 系統與 API 設定")
+# --- 富邦 API 資安與自動連線區塊 ---
+st.sidebar.header("⚙️ 系統狀態")
 
-# 1. 檢查是否已在 Streamlit Secrets 設定帳密
+# 1. 讀取 Secrets 金鑰保險箱
 try:
     fubon_user = st.secrets["FUBON_USER"]
     fubon_pass = st.secrets["FUBON_PASS"]
     cert_pass = st.secrets["CERT_PASS"]
+    cert_base64 = st.secrets["FUBON_CERT_BASE64"]
 except Exception:
-    st.error("⚠️ 系統錯誤：尚未在 Streamlit Cloud 後台設定富邦 API 帳密 (Secrets)！請先完成設定。")
+    st.error("⚠️ 系統錯誤：尚未在 Streamlit Cloud 後台設定完整的富邦 API 帳密與憑證 Base64 (Secrets)！")
     st.stop()
 
-# 2. 憑證上傳機制 (避免憑證放 GitHub 被盜用)
-cert_file = st.sidebar.file_uploader("請上傳您的富邦憑證 (.pfx)", type=['pfx'])
-if cert_file is not None:
-    with open("fubon_cert.pfx", "wb") as f:
-        f.write(cert_file.getbuffer())
-    st.sidebar.success("憑證已暫存於雲端！")
+# 2. 自動還原憑證 (從亂碼變回暫存的實體檔案供 API 讀取)
+cert_path = "temp_fubon_cert.pfx"
+if not os.path.exists(cert_path):
+    with open(cert_path, "wb") as f:
+        f.write(base64.b64decode(cert_base64))
 
-if not os.path.exists("fubon_cert.pfx"):
-    st.warning("👈 請先在左側選單上傳您的【富邦憑證 (.pfx)】才能連線抓取資料。")
-    st.stop()
-
-# 3. 初始化富邦 SDK
+# 3. 初始化富邦 SDK (無感登入)
 if "fubon_sdk" not in st.session_state:
     try:
         sdk = FubonSDK()
-        # 進行登入
-        res = sdk.init(fubon_user, fubon_pass, "fubon_cert.pfx", cert_pass)
+        res = sdk.init(fubon_user, fubon_pass, cert_path, cert_pass)
         if res:
             st.session_state.fubon_sdk = sdk
-            st.sidebar.success("✅ 富邦 API 連線成功")
+            st.sidebar.success("✅ 富邦 API 連線成功 (自動授權)")
         else:
-            st.sidebar.error("❌ 富邦 API 連線失敗，請檢查帳密或憑證。")
+            st.sidebar.error("❌ 富邦 API 連線失敗，請檢查帳密或憑證密碼。")
             st.stop()
     except Exception as e:
         st.sidebar.error(f"登入發生異常: {e}")
@@ -83,17 +79,14 @@ if analyze_btn:
         try:
             sdk = st.session_state.fubon_sdk
             
-            # 設定抓取時間範圍 (抓過去 20 天以確保有至少 5 個交易日可算均量)
             end_date = datetime.now().strftime("%Y%m%d")
             start_date = (datetime.now() - timedelta(days=20)).strftime("%Y%m%d")
             
-            # 抓取歷史 K 線
             kline_data = sdk.marketdata.historical_kline(stock_id, start_date, end_date)
             
             if not kline_data:
                 st.error(f"找不到代號 {stock_id} 的資料，或該股票近期無交易。")
             else:
-                # 整理富邦回傳的資料結構
                 df = pd.DataFrame([vars(k) for k in kline_data])
                 df['close'] = df['close'].astype(float)
                 df['open'] = df['open'].astype(float)
@@ -101,17 +94,14 @@ if analyze_btn:
                 df['low'] = df['low'].astype(float)
                 df['volume'] = df['volume'].astype(float)
                 
-                # 確保照時間排序
                 df = df.sort_values(by='date').reset_index(drop=True)
 
-                # 提取最新一日的數據
                 today_open = df['open'].iloc[-1]
                 today_high = df['high'].iloc[-1]
                 today_low = df['low'].iloc[-1]
                 today_close = df['close'].iloc[-1]
                 today_vol = df['volume'].iloc[-1]
                 
-                # 計算過去 5 日平均成交量 (不含今日，或含今日皆可，此處採最後 5 筆)
                 vol_5d_avg = df['volume'].tail(5).mean()
 
                 # 分析項目一：上影線與量能壓力指標 (佔 25 分)
@@ -123,7 +113,6 @@ if analyze_btn:
                 is_long_upper_shadow = upper_shadow_ratio >= 0.5
                 is_huge_volume = today_vol > vol_5d_avg
 
-                # 評分邏輯
                 score_1 = 0
                 reason_1 = ""
                 if not is_long_upper_shadow:
@@ -136,7 +125,6 @@ if analyze_btn:
                     score_1 = 0
                     reason_1 = "出現長上影線且伴隨爆大量，上方賣壓極重"
 
-                # 輸出結果
                 st.subheader(f"📊 {stock_id} 量化分析結果")
                 st.write(f"最新收盤價: **{today_close:.2f}** | 今日成交量: **{today_vol:,.0f}** | 5日均量: **{vol_5d_avg:,.0f}**")
                 
