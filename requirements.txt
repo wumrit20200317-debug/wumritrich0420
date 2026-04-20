@@ -3,4 +3,4 @@ pandas
 fubon-neo
 gspread
 google-auth
-pandas_ta
+pandas-ta
