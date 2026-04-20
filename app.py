@@ -1,7 +1,7 @@
 import streamlit as st
 
 # --- 系統設定 (這部分未來會教您放進 Secrets) ---
-SYSTEM_PASSWORD = "你的專屬密碼123" 
+SYSTEM_PASSWORD = "lnp666" 
 
 # --- 網頁介面設置 ---
 st.set_page_config(page_title="飆股量化分析系統 1150418", layout="wide")
