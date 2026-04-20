@@ -1,3 +1,6 @@
 streamlit
 pandas
 fubon-neo
+gspread
+google-auth
+pandas_ta
