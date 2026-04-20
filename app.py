@@ -1,145 +1,39 @@
 import streamlit as st
 import pandas as pd
-import pandas_ta as ta
 import os
-import base64
-import json
-import gspread
-from google.oauth2.service_account import Credentials
-from datetime import datetime, timedelta
-from fubon_neo.sdk import FubonSDK
 
-# --- 1. 系統安全與介面設定 ---
-SYSTEM_PASSWORD = "lnp666"
-st.set_page_config(page_title="飆股量化分析系統 1150418", layout="wide")
-
-if "login_status" not in st.session_state:
-    st.session_state.login_status = False
-
-def check_login():
-    if st.session_state.password_input == SYSTEM_PASSWORD:
-        st.session_state.login_status = True
-    else:
-        st.error("密碼錯誤，請重新輸入！")
-
-if not st.session_state.login_status:
-    st.title("🔐 系統安全檢查")
-    st.text_input("請輸入系統存取密碼：", type="password", key="password_input", on_change=check_login)
-    st.stop()
-
-# --- 2. 雲端儲存 (Google Sheets) 初始化 ---
-def save_to_google_sheets(data_row):
-    try:
-        scope = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
-        creds_info = json.loads(st.secrets["GOOGLE_SHEETS_CREDENTIALS"])
-        creds = Credentials.from_service_account_info(creds_info, scopes=scope)
-        client = gspread.authorize(creds)
-        sheet = client.open(st.secrets["GOOGLE_SHEET_NAME"]).sheet1
-        sheet.append_row(data_row)
-        return True
-    except Exception as e:
-        st.error(f"寫入雲端硬碟失敗，請確認是否已共用權限給 JSON 裡的 Email: {e}")
-        return False
-
-# --- 3. 富邦 API 自動連線 ---
-st.sidebar.header("⚙️ 系統狀態")
+# 嘗試讀取套件，測試安裝是否成功
 try:
-    fubon_user = st.secrets["FUBON_USER"]
-    fubon_pass = st.secrets["FUBON_PASS"]
-    cert_pass = st.secrets["CERT_PASS"]
-    cert_base64 = st.secrets["FUBON_CERT_BASE64"]
-except Exception:
-    st.error("⚠️ 偵測到金鑰尚未設定，請在 Streamlit 後台設定 Secrets。")
-    st.stop()
+    import fubon_neo
+    import gspread
+    import pandas_ta
+    import google.auth
+    install_status = "✅ 所有必要套件安裝成功！"
+except Exception as e:
+    install_status = f"❌ 套件讀取失敗：{e}"
 
-cert_path = "temp_fubon_cert.pfx"
-if not os.path.exists(cert_path):
-    with open(cert_path, "wb") as f:
-        f.write(base64.b64decode(cert_base64))
+st.set_page_config(page_title="系統環境測試")
 
-if "fubon_sdk" not in st.session_state:
-    try:
-        sdk = FubonSDK()
-        res = sdk.init(fubon_user, fubon_pass, cert_path, cert_pass)
-        if res:
-            st.session_state.fubon_sdk = sdk
-            st.sidebar.success("✅ 富邦 API 連線成功")
-        else:
-            st.sidebar.error("❌ 富邦登入失敗，請檢查憑證密碼。")
-            st.stop()
-    except Exception as e:
-        st.sidebar.error(f"連線異常: {e}")
-        st.stop()
+st.title("🧪 系統環境檢查站")
 
-# --- 4. 核心量化引擎 ---
-st.title("🚀 飆股量化分析系統 1150418")
-stock_id = st.text_input("請輸入台股代號", value="2330")
-analyze_btn = st.button("啟動量化分析並儲存結果")
+# 1. 檢查安裝狀態
+st.subheader("1. 軟體套件狀態")
+if "✅" in install_status:
+    st.success(install_status)
+else:
+    st.error(install_status)
 
-if analyze_btn:
-    with st.spinner('正在從富邦伺服器提取海量數據並進行量化運算...'):
-        try:
-            sdk = st.session_state.fubon_sdk
-            today_str = datetime.now().strftime("%Y-%m-%d")
-            
-            # 抓取足夠天數以計算指標 (至少 40 天)
-            kline_data = sdk.marketdata.historical_kline(stock_id, (datetime.now()-timedelta(days=60)).strftime("%Y%m%d"), datetime.now().strftime("%Y%m%d"))
-            
-            if kline_data:
-                df = pd.DataFrame([vars(k) for k in kline_data])
-                df[['close', 'open', 'high', 'low', 'volume']] = df[['close', 'open', 'high', 'low', 'volume']].astype(float)
-                
-                # 計算 KD 值 (9, 3, 3)
-                kd = ta.stoch(df['high'], df['low'], df['close'], k=9, d=3, smooth_k=3)
-                df = pd.concat([df, kd], axis=1)
-                
-                curr = df.iloc[-1]
-                prev = df.iloc[-2]
-                avg_vol_5d = df['volume'].tail(5).mean()
+# 2. 檢查 Secrets 裡面有沒有 Google 的東西
+st.subheader("2. 金鑰保險箱 (Secrets) 檢查")
+if "GOOGLE_SHEETS_CREDENTIALS" in st.secrets:
+    st.success("✅ Google JSON 金鑰已偵測到")
+else:
+    st.warning("⚠️ 尚未偵測到 Google 金鑰，請檢查 Secrets 區塊。")
 
-                # --- [項目一]：上影線與量能壓力 (25分) ---
-                s_ratio = (curr.high - max(curr.close, curr.open)) / (curr.high - curr.low) if curr.high != curr.low else 0
-                if s_ratio < 0.5:
-                    score1, desc1 = 25, "無長上影線"
-                elif curr.volume > avg_vol_5d:
-                    score1, desc1 = 0, "長上影線且爆大量"
-                else:
-                    score1, desc1 = 15, "有長上影線但量能未失控"
+if "FUBON_CERT_BASE64" in st.secrets:
+    st.success("✅ 富邦憑證亂碼已偵測到")
+else:
+    st.warning("⚠️ 尚未偵測到富邦憑證，請檢查 Secrets 區塊。")
 
-                # --- [項目二]：價格防守指標 (25分) ---
-                if curr.close > prev.high:
-                    score2, desc2 = 25, "力道延續(過前高)"
-                elif curr.close < prev.low:
-                    score2, desc2 = 0, "支撐破裂(破前低)"
-                else:
-                    score2, desc2 = 15, "區間震盪"
-
-                # --- [項目三]：KD 位階狀態 (20分) ---
-                curr_k = curr['STOCHk_9_3_3']
-                if curr_k < 20:
-                    score3, desc3 = 20, f"低檔超賣(K:{curr_k:.1f})"
-                elif 20 <= curr_k < 50:
-                    score3, desc3 = 15, f"中低位階(K:{curr_k:.1f})"
-                elif 50 <= curr_k < 80:
-                    score3, desc3 = 10, f"中高位階(K:{curr_k:.1f})"
-                else:
-                    score3, desc3 = 0, f"高檔過熱(K:{curr_k:.1f})"
-
-                total_score = score1 + score2 + score3
-                
-                # 介面渲染
-                st.subheader(f"📊 {stock_id} 綜合評分：{total_score} / 70 分")
-                st.progress(total_score / 70)
-                
-                c1, c2, c3 = st.columns(3)
-                c1.metric("上影線指標", f"{score1}分", desc1)
-                c2.metric("價格防守指標", f"{score2}分", desc2)
-                c3.metric("KD 位階狀態", f"{score3}分", desc3)
-
-                # 同步儲存至雲端
-                record = [today_str, stock_id, total_score, f"{desc1} | {desc2} | {desc3}"]
-                if save_to_google_sheets(record):
-                    st.success("✅ 數據分析已永久存檔至您的 Google 試算表。")
-            
-        except Exception as e:
-            st.error(f"分析發生異常: {e}")
+st.write("---")
+st.write("請先確認以上兩項都變綠色（✅），我們再進行下一步的分析邏輯開發。")
