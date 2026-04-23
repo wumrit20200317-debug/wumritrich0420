@@ -62,18 +62,18 @@ if not os.path.exists(cert_path):
 if "fubon_sdk" not in st.session_state:
     try:
         sdk = FubonSDK()
-        # 修正：富邦官方 SDK 的登入函式為 login()，非 init()
         res = sdk.login(fubon_user, fubon_pass, cert_path, cert_pass)
         
-        # 官方回傳格式包含 is_success 屬性
         if res.is_success:
+            # 修正 1：2.2.8 版本必須呼叫 init_realtime() 才能啟動行情模組
+            sdk.init_realtime() 
             st.session_state.fubon_sdk = sdk
             st.sidebar.success("✅ 富邦 API 連線成功")
         else:
             st.sidebar.error(f"❌ 富邦登入失敗: {res.message}")
             st.stop()
     except Exception as e:
-        st.sidebar.error(f"API 異常: {e}")
+        st.sidebar.error(f"API 初始化異常: {e}")
         st.stop()
 
 # --- 4. 核心量化分析與視覺化區塊 ---
@@ -87,11 +87,17 @@ if analyze_btn:
             sdk = st.session_state.fubon_sdk
             today_str = datetime.now().strftime("%Y-%m-%d")
             
-            # 抓取近 90 天 K 線資料
-            kline_data = sdk.marketdata.historical_kline(stock_id, (datetime.now()-timedelta(days=90)).strftime("%Y%m%d"), datetime.now().strftime("%Y%m%d"))
+            # 修正 2：依據最新官方文檔替換為 2.2.8 版專用的歷史 K 線抓取語法
+            rest_stock = sdk.marketdata.rest_client.stock
+            from_date = (datetime.now() - timedelta(days=90)).strftime("%Y-%m-%d")
+            to_date = datetime.now().strftime("%Y-%m-%d")
             
-            if kline_data:
-                df = pd.DataFrame([vars(k) for k in kline_data])
+            # 發送行情請求
+            kline_res = rest_stock.historical.candles(**{'symbol': stock_id, 'from': from_date, 'to': to_date})
+            
+            # 修正 3：對應最新回傳格式進行資料解析
+            if kline_res and 'data' in kline_res and len(kline_res['data']) > 0:
+                df = pd.DataFrame(kline_res['data'])
                 df[['close', 'open', 'high', 'low', 'volume']] = df[['close', 'open', 'high', 'low', 'volume']].astype(float)
                 
                 # 確保日期欄位存在，若無則使用 index
@@ -211,7 +217,7 @@ if analyze_btn:
                     st.success("✅ 分析完成！數據與判定理由已寫入 Google 試算表。")
                     
             else:
-                 st.warning("⚠️ 無法獲取 K 線資料，請確認台股代號是否正確。")
+                 st.warning("⚠️ 無法獲取 K 線資料，請確認台股代號是否正確，或富邦是否在維護中。")
 
         except Exception as e:
             st.error(f"分析過程發生錯誤: {e}")
