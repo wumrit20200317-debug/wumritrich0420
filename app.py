@@ -1,226 +1,312 @@
 import streamlit as st
+import time
+import json
+import google.generativeai as genai
+import yfinance as yf
+import plotly.graph_objects as go
+import os
 import pandas as pd
 import numpy as np
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-import datetime
-import base64
-import json
-import gspread
-from oauth2client.service_account import ServiceAccountCredentials
-from fubon_neo.sdk import FubonSDK, Mode
-from fubon_neo.constant import TimeInForce, OrderType, PriceType, MarketType
+import random
+from datetime import datetime, timedelta
+import urllib.request
+import re
 
-# --- 1. 系統安全性與頁面設定 ---
-st.set_page_config(page_title="大家跟CHECHE一起賺大錢1.0", layout="wide")
+# 試算表套件
+try:
+    import gspread
+    from oauth2client.service_account import ServiceAccountCredentials
+    GSHEET_AVAILABLE = True
+except ImportError:
+    GSHEET_AVAILABLE = False
 
+# 富邦 SDK 
+try:
+    from fubon_neo.sdk import FubonSDK, Mode
+    FUBON_AVAILABLE = True
+except ImportError:
+    FUBON_AVAILABLE = False
+
+# ==========================================
+# 0. 頁面配置
+# ==========================================
+st.set_page_config(page_title="大家跟CHECHE一起賺大錢1.0", page_icon="🎯", layout="wide")
+
+# ==========================================
+# 1. 密碼大門邏輯 (Security Gate)
+# ==========================================
 def check_password():
-    if "password_correct" not in st.session_state:
-        st.session_state["password_correct"] = False
-    if st.session_state["password_correct"]:
-        return True
-    st.title("大家跟CHECHE一起賺大錢 1.0")
-    password = st.text_input("請輸入系統授權碼", type="password")
-    if st.button("登入"):
-        if password == "lnp666":
+    def password_entered():
+        if st.session_state["password"] == st.secrets.get("password", "lnp666"):
             st.session_state["password_correct"] = True
-            st.rerun()
+            del st.session_state["password"]
         else:
-            st.error("授權碼錯誤。")
-    return False
+            st.session_state["password_correct"] = False
+
+    if "password_correct" not in st.session_state:
+        st.title("🔐 大家跟CHECHE一起賺大錢1.0 - 認證登入")
+        st.text_input("請輸入通關密碼：", type="password", on_change=password_entered, key="password")
+        return False
+    elif not st.session_state["password_correct"]:
+        st.title("🔐 大家跟CHECHE一起賺大錢1.0 - 認證登入")
+        st.text_input("請輸入通關密碼：", type="password", on_change=password_entered, key="password")
+        st.error("❌ 密碼錯誤，請重新輸入。")
+        return False
+    return True
 
 if not check_password():
     st.stop()
 
-# --- 2. 富邦 API 初始化 ---
-@st.cache_resource
-def get_fubon_sdk():
-    try:
-        acc = st.secrets["fubon"]["account"]
-        pwd = st.secrets["fubon"]["password"]
-        api_key = st.secrets["fubon"]["api_key"]
-        cert_b64 = st.secrets["fubon"]["cert_base64"]
-        cert_pwd = st.secrets["fubon"]["cert_password"]
+# ==========================================
+# 2. 金庫防錯與調度中心 (Secrets Helper)
+# ==========================================
+def get_secret_val(key_name, default=None):
+    if key_name in st.secrets: return st.secrets[key_name]
+    for k in st.secrets.keys():
+        if key_name in k: return st.secrets[k]
+    return default
 
-        with open("fubon_cert.pfx", "wb") as f:
-            f.write(base64.b64decode(cert_b64))
+# Gemini 金鑰讀取
+API_KEYS = []
+try:
+    raw_keys = get_secret_val("api_keys")
+    if raw_keys:
+        if hasattr(raw_keys, "values"): API_KEYS = list(raw_keys.values())
+        elif isinstance(raw_keys, list): API_KEYS = [str(k) for k in raw_keys]
+        elif isinstance(raw_keys, str): API_KEYS = [k.strip() for k in raw_keys.split(",") if k.strip()]
+except: pass
 
-        sdk = FubonSDK()
-        sdk.login(acc, pwd, api_key)
-        sdk.init_realtime(Mode.Simulation)
-        return sdk
-    except Exception as e:
-        st.error(f"富邦 API 連線異常: {e}")
-        return None
+if not API_KEYS:
+    st.error("❌ 系統偵測不到有效的 Gemini API 金鑰，請確認 Secrets 設定。")
+    st.stop()
 
-# --- 3. 背景記憶庫 (Google 試算表) ---
-def silent_log_to_sheet(data_row):
-    try:
-        scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-        creds_json = json.loads(st.secrets["google"]["service_account"])
-        creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_json, scope)
-        client = gspread.authorize(creds)
-        sheet = client.open("Stock_Analysis_History").sheet1
-        sheet.append_row(data_row)
-    except:
-        pass 
+if 'key_pool' not in st.session_state:
+    st.session_state.key_pool = {i: datetime.now() for i in range(len(API_KEYS))}
 
-# --- 4. 核心運算：技術指標 (朱家泓 SOP) ---
-def compute_technical_indicators(df):
-    df['MA5'] = df['close'].rolling(5).mean()
-    df['MA10'] = df['close'].rolling(10).mean()
-    df['MA20'] = df['close'].rolling(20).mean()
-    df['MA60'] = df['close'].rolling(60).mean()
-    
-    low_9 = df['low'].rolling(9).min()
-    high_9 = df['high'].rolling(9).max()
-    rsv = 100 * (df['close'] - low_9) / (high_9 - low_9)
-    df['K'] = rsv.ewm(com=2, adjust=False).mean()
-    df['D'] = df['K'].ewm(com=2, adjust=False).mean()
-    
-    ema12 = df['close'].ewm(span=12, adjust=False).mean()
-    ema26 = df['close'].ewm(span=26, adjust=False).mean()
-    df['DIF'] = ema12 - ema26
-    df['DEA'] = df['DIF'].ewm(span=9, adjust=False).mean()
-    df['MACD'] = (df['DIF'] - df['DEA']) * 2
-    
-    df['VMA5'] = df['volume'].rolling(5).mean()
-    return df
-
-# --- 5. 核心量化分析邏輯 ---
-def perform_full_analysis(symbol, cost, df):
-    curr = df.iloc[-1]
-    prev = df.iloc[-2]
-    
-    veto_triggers = []
-    if curr['close'] < curr['MA20'] and curr['MA20'] < prev['MA20']:
-        veto_triggers.append("破下彎月線")
-    if curr['close'] < curr['MA60'] and curr['MA60'] < prev['MA60']:
-        veto_triggers.append("季線蓋頭反壓")
-    if curr['MA5'] < curr['MA10'] and curr['MA10'] < curr['MA20'] and curr['MA20'] < prev['MA20']:
-        veto_triggers.append("均線三線空頭排列")
-    if curr['close'] < df['low'].iloc[-20:-1].min():
-        veto_triggers.append("跌破前波低點")
-    if curr['volume'] > curr['VMA5'] * 2 and curr['close'] < curr['open'] and curr['close'] < prev['close']:
-        veto_triggers.append("高檔爆量長黑")
-
-    if veto_triggers:
-        return 0, f"【一票否決】原因：{', '.join(veto_triggers)}", "風險警告模式", [], {}
-
-    if curr['MA20'] > prev['MA20'] and curr['close'] >= curr['MA20'] * 0.98:
-        mode = "模式 B：多頭回檔模式"
-        weights = {"趨勢": 35, "型態": 25, "量價": 20, "指標": 20}
-    else:
-        mode = "模式 A：盤整突破模式"
-        weights = {"趨勢": 30, "型態": 35, "量價": 20, "指標": 15}
-
-    scores = {"趨勢": 0, "型態": 0, "量價": 0, "指標": 0}
-    details = []
-
-    if curr['MA5'] > curr['MA10'] > curr['MA20']:
-        scores["趨勢"] = weights["趨勢"]
-        details.append(f"趨勢：多頭排列 (+{weights['趨勢']}分)")
-    elif curr['close'] > curr['MA20']:
-        scores["趨勢"] = weights["趨勢"] * 0.6
-        details.append(f"趨勢：站上月線 (+{scores['趨勢']:.1f}分)")
-
-    recent_high = df['high'].iloc[-20:-1].max()
-    if curr['close'] > recent_high:
-        scores["型態"] = weights["型態"]
-        details.append(f"型態：突破前高 (+{weights['型態']}分)")
-    else:
-        scores["型態"] = weights["型態"] * 0.4
-        details.append(f"型態：區間震盪 (+{scores['型態']:.1f}分)")
-
-    if curr['volume'] > curr['VMA5'] * 1.5 and curr['close'] > curr['open']:
-        scores["量價"] = weights["量價"]
-        details.append(f"量價：帶量長紅 (+{weights['量價']}分)")
-    else:
-        scores["量價"] = weights["量價"] * 0.5
-        details.append(f"量價：量能平穩 (+{scores['量價']:.1f}分)")
-
-    if curr['K'] > curr['D'] and curr['MACD'] > 0:
-        scores["指標"] = weights["指標"]
-        details.append(f"指標：KD金叉且MACD雙多 (+{weights['指標']}分)")
-    elif curr['K'] > curr['D']:
-        scores["指標"] = weights["指標"] * 0.7
-        details.append(f"指標：KD金叉 (+{scores['指標']:.1f}分)")
-
-    total = sum(scores.values())
-    conclusion = f"分析結論：{mode}。總分 {total:.1f}。{'積極關注' if total >= 80 else '分批佈局' if total >= 60 else '觀望為宜'}。"
-    
-    return total, conclusion, mode, details, scores
-
-# --- 6. 介面呈現 ---
-st.title("大家跟CHECHE一起賺大錢1.0")
+# 富邦狀態偵測
+fubon_cfg = get_secret_val("fubon")
+fubon_status = "🟢 已連線" if fubon_cfg else "🔴 未連線 (Secret 缺失)"
 
 with st.sidebar:
-    st.write("### 系統狀態")
-    sdk = get_fubon_sdk()
-    if sdk:
-        st.success("富邦 API：已連線")
-    else:
-        st.error("富邦 API：未連線")
+    st.header("🔌 系統狀態")
+    st.write(f"富邦 API：{fubon_status}")
+    if not fubon_cfg: st.caption("請確認 Secrets 中有 [fubon] 區塊")
 
-input_raw = st.text_input("請輸入台股代號 (多筆用逗號隔開，可加成本價 @):", placeholder="例如: 2330, 3163@400")
+# 本地暫存 (解決休眠前當次使用的顯示問題)
+if 'db' not in st.session_state:
+    st.session_state.db = {"manual_results": []}
 
-if st.button("執行量化分析"):
-    if not input_raw:
-        st.warning("請輸入代號")
+# ==========================================
+# 3. Google 試算表寫入引擎 (背景靜默執行)
+# ==========================================
+def write_to_gsheet_silent(data):
+    if not GSHEET_AVAILABLE: return
+    try:
+        gcp_creds = get_secret_val("gcp")
+        sheet_url = get_secret_val("gsheet_url")
+        if not gcp_creds or not sheet_url: return
+        
+        scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(dict(gcp_creds), scope)
+        client = gspread.authorize(creds)
+        sheet = client.open_by_url(sheet_url).sheet1
+        
+        # 整理要寫入的欄位 (時間, 代號, 名稱, 成本, 現價, 總分, 否決條件, AI結論)
+        row = [
+            data.get('timestamp', ''),
+            data.get('resolved_ticker', ''),
+            data.get('stock_name', ''),
+            data.get('cost_price', ''),
+            data.get('current_price', ''),
+            data.get('total_score', ''),
+            data.get('veto_alert', ''),
+            data.get('conclusion', '')
+        ]
+        sheet.append_row(row)
+    except Exception as e:
+        # 靜默失敗，不干擾使用者主流程
+        pass
+
+# ==========================================
+# 4. 數據與計算引擎 (yfinance)
+# ==========================================
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_chinese_name(tk):
+    try:
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+        url = f"https://tw.stock.yahoo.com/quote/{tk}" if tk.isdigit() else f"https://hk.finance.yahoo.com/quote/{tk}"
+        req = urllib.request.Request(url, headers=headers)
+        html = urllib.request.urlopen(req, timeout=3).read().decode('utf-8')
+        if tk.isdigit():
+            match = re.search(r'<title>(.*?)\(', html)
+            if match: return match.group(1).strip()
+        else:
+            match = re.search(r'<title>(.*?)\s+\(', html)
+            if match: return match.group(1).replace('股票價格', '').replace('今日', '').strip()
+    except: pass
+    return "" 
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_stock_data(ticker):
+    try:
+        tk = ticker + ".TW" if ticker.isdigit() else ticker
+        df = yf.Ticker(tk).history(period="1y")
+        if df.empty and ticker.isdigit():
+            df = yf.Ticker(ticker + ".TWO").history(period="1y")
+        return df if not df.empty else None
+    except: return None
+
+def calculate_ta(df):
+    try:
+        c = df['Close'].iloc[-1]
+        ma5 = df['Close'].rolling(5).mean().iloc[-1]
+        ma20 = df['Close'].rolling(20).mean().iloc[-1]
+        ma20_yest = df['Close'].rolling(20).mean().iloc[-2]
+        ma60 = df['Close'].rolling(60).mean().iloc[-1]
+        ma60_yest = df['Close'].rolling(60).mean().iloc[-2]
+        vol = df['Volume'].iloc[-1]
+        vol5ma = df['Volume'].rolling(5).mean().iloc[-1]
+        h20 = df['High'].tail(20).max()
+        l20 = df['Low'].tail(20).min()
+        
+        low_9 = df['Low'].rolling(9).min()
+        high_9 = df['High'].rolling(9).max()
+        rsv = (df['Close'] - low_9) / (high_9 - low_9) * 100
+        k = rsv.ewm(alpha=1/3).mean().iloc[-1]
+        d = k # 簡化
+        
+        return {
+            "C": round(c, 2), "MAs": [round(ma5,2), ma20, ma60],
+            "T20": 1 if ma20 > ma20_yest else 0, "T60": 1 if ma60 > ma60_yest else 0,
+            "Vol": vol, "Vol5": vol5ma, "H20": h20, "L20": l20, "K": k, "D": d
+        }
+    except: return None
+
+def get_scores(ta):
+    scores = {"MA": 0, "Pattern": 0, "Vol": 0, "KD": 0}
+    vetos = []
+    
+    # 否決邏輯
+    if ta['C'] < ta['MAs'][1] and ta['T20'] == 0: vetos.append("股價跌破月線且下彎")
+    if ta['C'] < ta['L20']: vetos.append("股價跌破前波低點")
+    
+    # 給分原因 (100滿分配置)
+    if ta['C'] > ta['MAs'][0]: scores["MA"] = 25
+    if ta['Vol'] > ta['Vol5']: scores["Vol"] = 25
+    if ta['K'] > ta['D']: scores["KD"] = 25
+    if ta['C'] >= ta['H20'] * 0.95: scores["Pattern"] = 25
+    
+    total = sum(scores.values())
+    radar = [scores["MA"], scores["Pattern"], 10, scores["Vol"], 10, 10, scores["KD"], 10]
+    return total, radar, vetos
+
+# ==========================================
+# 5. AI 調度 (Gemini 引擎)
+# ==========================================
+SYS_INSTRUCT = """你是專業的波段量化分析師。嚴格回傳純JSON。鍵值：
+{"trading_plan": {"buy_zone":"建議買區","stop_loss":"停損價位","take_profit":"停利預估","risk_reward_eval":"風報比簡評"}, 
+"conclusion": "針對目前得分與狀態，給出綜合操作說明"}"""
+
+def ask_gemini(prompt_data):
+    num_keys = len(API_KEYS)
+    for attempt in range(num_keys * 2): 
+        idx = attempt % num_keys
+        genai.configure(api_key=API_KEYS[idx])
+        model = genai.GenerativeModel('gemini-2.5-flash', system_instruction=SYS_INSTRUCT)
+        try:
+            res = model.generate_content(prompt_data, generation_config=genai.types.GenerationConfig(temperature=0.0))
+            raw = res.text
+            parsed = json.loads(raw[raw.find('{'):raw.rfind('}')+1])
+            return parsed
+        except: time.sleep(1); continue
+    return {"conclusion": "AI 分析暫時無法取得，請稍後再試。", "trading_plan": {}}
+
+# ==========================================
+# 6. UI 渲染
+# ==========================================
+def plot_kline(df, cost=None):
+    try:
+        df['5MA'], df['20MA'], df['60MA'] = [df['Close'].rolling(w).mean() for w in [5, 20, 60]]
+        df = df.tail(60)
+        fig = go.Figure(data=[go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name='日K')])
+        for ma, color, n in [(df['5MA'], 'blue', '5MA'), (df['20MA'], 'green', '20MA'), (df['60MA'], 'purple', '60MA')]:
+            fig.add_trace(go.Scatter(x=df.index, y=ma, line=dict(color=color, width=1.5), name=n))
+        if cost: fig.add_hline(y=cost, line_dash="dash", line_color="red", annotation_text=f"成本: {cost}")
+        fig.update_layout(height=350, margin=dict(l=0,r=0,t=20,b=0), xaxis_rangeslider_visible=False)
+        return fig
+    except: return None
+
+def plot_radar(scores):
+    cats = ['均線', '型態', '支撐', '價量', '主流', 'MACD', 'KD', '乖離']
+    fig = go.Figure(data=go.Scatterpolar(r=scores, theta=cats, fill='toself'))
+    fig.update_layout(height=300, margin=dict(l=20, r=20, t=20, b=20), polar=dict(radialaxis=dict(visible=True, range=[0, 30])))
+    return fig
+
+# ==========================================
+# 7. 主程式執行區
+# ==========================================
+st.title("🎯 大家跟CHECHE一起賺大錢1.0")
+st.info("💡 輸入代號(如 `2330`)，持股加成本(如 `3163@400`)，逗號可批次輸入。")
+
+user_in = st.text_input("請輸入診斷清單：", placeholder="例如: 2330, 2454@1000")
+
+if st.button("🚀 啟動診斷", type="primary", use_container_width=True):
+    tickers = [t.strip() for t in user_in.split(",") if t.strip()]
+    if not tickers: st.warning("請先輸入股號！")
     else:
-        entries = [e.strip() for e in input_raw.split(",")]
-        for entry in entries:
-            if "@" in entry:
-                symbol, cost = entry.split("@")
-            else:
-                symbol, cost = entry, "未設定"
+        for tk_raw in tickers:
+            tk, cost = (tk_raw.split("@")[0].upper(), float(tk_raw.split("@")[1])) if "@" in tk_raw else (tk_raw.upper(), None)
+            df = get_stock_data(tk)
+            if df is not None:
+                ta = calculate_ta(df)
+                total_s, radar_s, vetos = get_scores(ta)
+                name = get_chinese_name(tk)
+                
+                mini_prompt = f'{{"T":"{tk}","C":{ta["C"]},"Score":{total_s},"Vetos":{vetos}}}'
+                ai_res = ask_gemini(mini_prompt)
+                
+                res_data = {
+                    "resolved_ticker": tk, "stock_name": name, "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "total_score": total_s, "radar_scores": radar_s, "veto_alert": "；".join(vetos) if vetos else "無", 
+                    "current_price": ta['C'], "cost_price": cost,
+                    "conclusion": ai_res.get("conclusion", ""), "trading_plan": ai_res.get("trading_plan", {})
+                }
+                
+                # 1. 存入本地畫面顯示
+                st.session_state.db["manual_results"].insert(0, res_data)
+                # 2. 靜默寫入 Google 試算表 (做為永久回測留存)
+                write_to_gsheet_silent(res_data)
+                
+        st.rerun()
+
+# 顯示紀錄
+for i, item in enumerate(st.session_state.db["manual_results"]):
+    tk, name, cost, price = item['resolved_ticker'], item['stock_name'], item['cost_price'], item['current_price']
+    pnl_tag = f"&nbsp;&nbsp;<span style='color:{'#ff4b4b' if price>=cost else '#00cc96'}; font-weight:bold;'>【帳面: {'+' if price>=cost else ''}{round((price-cost)/cost*100, 2)}%】</span>" if cost else ""
+    
+    with st.expander(f"📌 {tk} {name} (現價: {price})", expanded=(i==0)):
+        st.markdown(f"🕒 *時間: {item['timestamp']}* {pnl_tag}", unsafe_allow_html=True)
+        
+        if item['veto_alert'] != "無": st.error(f"🚫 否決條件：{item['veto_alert']}")
+        st.markdown(f"<h1 style='text-align:center;'>{item['total_score']} / 100</h1>", unsafe_allow_html=True)
+        st.info(f"**📝 綜合說明：** {item['conclusion']}")
+        
+        c_left, c_right = st.columns([1, 1])
+        with c_left:
+            p = item['trading_plan']
+            if p:
+                st.warning(f"買區: {p.get('buy_zone')}\n\n停損: {p.get('stop_loss')}\n\n停利: {p.get('take_profit')}\n\n風報: {p.get('risk_reward_eval')}")
             
-            with st.spinner(f"分析 {symbol} 中..."):
-                # 模擬資料 (正式上線請替換為富邦 SDK 抓取邏輯)
-                dates = pd.date_range(end=datetime.date.today(), periods=100)
-                dummy_df = pd.DataFrame({
-                    'date': dates,
-                    'open': np.random.randn(100).cumsum() + 500,
-                    'high': np.random.randn(100).cumsum() + 510,
-                    'low': np.random.randn(100).cumsum() + 490,
-                    'close': np.random.randn(100).cumsum() + 500,
-                    'volume': np.random.randint(500, 2000, 100)
-                })
-                
-                df_with_idx = compute_technical_indicators(dummy_df)
-                total_score, summary, analysis_mode, detail_list, radar_data = perform_full_analysis(symbol, cost, df_with_idx)
-                
-                st.markdown(f"### 🔍 {symbol} 診斷報表 (成本: {cost})")
-                
-                c1, c2 = st.columns(2)
-                with c1:
-                    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.7, 0.3])
-                    fig.add_trace(go.Candlestick(x=df_with_idx['date'], open=df_with_idx['open'], high=df_with_idx['high'], low=df_with_idx['low'], close=df_with_idx['close'], name="K線"), row=1, col=1)
-                    fig.add_trace(go.Scatter(x=df_with_idx['date'], y=df_with_idx['MA20'], name="20MA"), row=1, col=1)
-                    fig.add_trace(go.Bar(x=df_with_idx['date'], y=df_with_idx['volume'], name="成交量"), row=2, col=1)
-                    fig.update_layout(height=400, xaxis_rangeslider_visible=False, margin=dict(t=0, b=0))
-                    st.plotly_chart(fig, use_container_width=True)
-                
-                with c2:
-                    if total_score > 0:
-                        categories = list(radar_data.keys())
-                        fig_radar = go.Figure()
-                        fig_radar.add_trace(go.Scatterpolar(r=list(radar_data.values()), theta=categories, fill='toself'))
-                        fig_radar.update_layout(polar=dict(radialaxis=dict(visible=True, range=[0, 35])), height=400, margin=dict(t=30, b=30))
-                        st.plotly_chart(fig_radar, use_container_width=True)
-                    else:
-                        st.error("觸發一票否決，不顯示雷達圖。")
-
-                st.write(f"**分析模式：** {analysis_mode}")
-                st.write(f"**判定結果：** {summary}")
-                with st.expander("詳細給分說明"):
-                    for d in detail_list:
-                        st.write(f"• {d}")
-                
-                copy_text = f"【大家跟CHECHE一起賺大錢】\n標的：{symbol}\n模式：{analysis_mode}\n總分：{total_score}\n判定：{summary}\n" + "\n".join(detail_list)
-                st.text_area("報告內容 (長按全選複製):", value=copy_text, height=120)
-                
-                silent_log_to_sheet([datetime.datetime.now().strftime("%Y-%m-%d %H:%M"), symbol, cost, total_score, summary])
-
-st.divider()
-st.caption("免責聲明：系統僅供學術研究，不構成投資建議。")
+            # 一鍵複製 (去除贅字)
+            copy_txt = f"代號: {tk} {name}\n總分: {item['total_score']}\n現價: {price}\n說明: {item['conclusion']}\n否決: {item['veto_alert']}"
+            st.markdown("<br>**📋 長按全選複製報告：**", unsafe_allow_html=True)
+            st.code(copy_txt, language="markdown")
+            
+        with c_right:
+            st.plotly_chart(plot_radar(item['radar_scores']), use_container_width=True)
+            df_k = get_stock_data(tk)
+            if df_k is not None: st.plotly_chart(plot_kline(df_k, cost), use_container_width=True)
+            
+if st.button("🗑️ 清空畫面紀錄"):
+    st.session_state.db = {"manual_results": []}
+    st.rerun()
