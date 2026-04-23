@@ -14,7 +14,9 @@ import re
 import base64
 from fubon_neo.sdk import FubonSDK, Mode
 
-# ==========================================\n# 1. 密碼大門邏輯 (Security Gate)\n# ==========================================
+# ==========================================
+# 1. 密碼大門邏輯 (Security Gate)
+# ==========================================
 def check_password():
     def password_entered():
         if st.session_state["password"] == st.secrets["password"]:
@@ -37,7 +39,9 @@ def check_password():
 if not check_password():
     st.stop()
 
-# ==========================================\n# 2. 富邦 API 初始化與連線\n# ==========================================
+# ==========================================
+# 2. 富邦 API 初始化與連線
+# ==========================================
 def init_fubon():
     if "fubon_sdk" not in st.session_state:
         try:
@@ -56,7 +60,9 @@ def init_fubon():
 
 init_fubon()
 
-# ==========================================\n# 3. 智能調度中心 (5把 API 最省邏輯)\n# ==========================================
+# ==========================================
+# 3. 智能調度中心 (5把 API 最省邏輯)
+# ==========================================
 try:
     raw_keys = st.secrets["api_keys"]
     if isinstance(raw_keys, str):
@@ -94,10 +100,11 @@ def delete_record(index):
         st.session_state.db['manual_results'].pop(index)
         save_history(st.session_state.db['manual_results'])
 
-# ==========================================\n# 4. 爬蟲與大數據精算\n# ==========================================
+# ==========================================
+# 4. 爬蟲與大數據精算
+# ==========================================
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_top_50_volume():
-    """爬取台股當日成交量前 50 大"""
     try:
         url = "https://tw.stock.yahoo.com/rank/volume"
         req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
@@ -123,7 +130,6 @@ def get_chinese_name(tk):
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_stock_data(ticker):
     try: 
-        # 捕捉 404 錯誤與下市股票
         df = yf.Ticker(ticker).history(period="1y")
         if df is None or df.empty or len(df) < 60: 
             return None
@@ -178,7 +184,9 @@ def calculate_technical_data(df, market_ret):
         }
     except: return None
 
-# ==========================================\n# 5. 鐵血計分引擎 (雷達圖資料)\n# ==========================================
+# ==========================================
+# 5. 鐵血計分引擎 (雷達圖資料)
+# ==========================================
 def get_python_scores(ta):
     scores = {}
     breakdown = {}
@@ -242,7 +250,9 @@ def get_python_scores(ta):
     radar = [scores["MA"], scores["Pattern"], scores["Support"], scores["Volume"], scores["RS"], scores["MACD"], scores["KD"], scores["BIAS"]]
     return total, radar, breakdown, veto_str
 
-# ==========================================\n# 6. 核心調度 (5把 API 最省使用法)\n# ==========================================
+# ==========================================
+# 6. 核心調度 (5把 API 最省使用法)
+# ==========================================
 SYS_INSTRUCT = """你是朱家泓波段長。以下是客觀技術分數(滿分100)。
 請嚴格回傳純JSON。鍵值：{"trading_plan":{"buy_zone":"建議買區","stop_loss":"停損價位","take_profit":"停利預估","risk_reward_eval":"風報比簡評"}, "conclusion":"綜合操作建議"}"""
 
@@ -250,20 +260,16 @@ def safe_generate_content(prompt_data):
     num_keys = len(API_KEYS)
     for attempt in range(num_keys * 2): 
         healthy_idx = -1
-        # 前面 N-1 把設定為免費/常規 API，最後 1 把設定為付費備用 API
         free_keys = list(range(num_keys - 1)) if num_keys > 1 else [0]
         vip_key = num_keys - 1 if num_keys > 1 else 0
         
-        # 1. 優先消耗免費 API
         for idx in free_keys:
             if datetime.now() >= st.session_state.key_pool[idx]:
                 healthy_idx = idx; break
         
-        # 2. 如果免費 API 都卡住(冷卻中)，才動用付費 API
         if healthy_idx == -1 and num_keys > 1 and datetime.now() >= st.session_state.key_pool[vip_key]:
             healthy_idx = vip_key
             
-        # 3. 如果全部都在冷卻，強制等待最短時間
         if healthy_idx == -1:
             wait_sec = (min(st.session_state.key_pool.values()) - datetime.now()).total_seconds() + 1
             if wait_sec > 0:
@@ -316,7 +322,9 @@ def run_analysis(ticker_input):
         return parsed
     except Exception as e: return {"error": f"系統異常: {str(e)}"}
 
-# ==========================================\n# 7. UI 與圖表渲染\n# ==========================================
+# ==========================================
+# 7. UI 與圖表渲染
+# ==========================================
 def plot_kline(df, cost=None):
     try:
         df['5MA'], df['10MA'], df['20MA'], df['60MA'] = [df['Close'].rolling(w).mean() for w in [5, 10, 20, 60]]
@@ -346,7 +354,9 @@ def plot_radar(scores_input):
         return fig
     except: return None
 
-# ==========================================\n# UI 介面層\n# ==========================================
+# ==========================================
+# UI 介面層
+# ==========================================
 with st.sidebar:
     st.markdown("### 系統狀態")
     st.info(st.session_state.get('fubon_status', '🔴 尚未初始化富邦 API'))
@@ -362,4 +372,87 @@ with st.sidebar:
             st.error("抓取失敗，請稍後再試。")
 
 st.title("🎯 大家跟CHECHE一起賺大錢 1.0")
-st.info("**💡 戰車指南：
+st.info("**💡 戰車指南：** 直接輸入代號(如 `2330`)，持股加成本(如 `3163@400`)，逗號可批次。")
+
+col_in, col_clear = st.columns([4, 1])
+with col_in: 
+    default_val = st.session_state.pop("auto_fill", "")
+    user_in = st.text_input("請輸入診斷清單：", value=default_val, key="main_in", placeholder="例如: 2330, AMD@170")
+with col_clear:
+    st.write("<br>", unsafe_allow_html=True)
+    if st.button("🗑️ 清空歷史"):
+        st.session_state.db = {"manual_results": []}
+        save_history([]); st.rerun()
+
+if st.button("🚀 啟動學術診斷", type="primary", use_container_width=True):
+    tickers = [t.strip() for t in user_in.split(",") if t.strip()]
+    if not tickers:
+        st.warning("⚠️ 請先在上方輸入框填寫股票代號！")
+    else:
+        prog, status = st.progress(0), st.empty()
+        has_error = False
+        
+        for idx, tk in enumerate(tickers):
+            status.info(f"⏳ 分析 {tk} ...")
+            res = run_analysis(tk)
+            if "error" not in res:
+                st.session_state.db['manual_results'].insert(0, {"full_ticker": res['resolved_ticker'], "deep": res})
+                save_history(st.session_state.db['manual_results'])
+            else: 
+                st.error(f"❌ {tk} 失敗：{res['error']}")
+                has_error = True
+            prog.progress((idx + 1) / len(tickers))
+            
+        status.empty()
+        if not has_error: st.rerun()
+
+for i, item in enumerate(st.session_state.db['manual_results']):
+    d = item['deep']
+    tk = d.get('resolved_ticker', '')
+    yahoo_tk = d.get('yahoo_ticker', tk) 
+    name = d.get('stock_name', '') 
+    cost, c_price = d.get('cost_price'), d.get('current_price', 0)
+    
+    pnl_tag = f"&nbsp;&nbsp;<span style='color:{'#ff4b4b' if c_price>=cost else '#00cc96'}; font-weight:bold;'>【帳面: {'+' if c_price>=cost else ''}{round((c_price-cost)/cost*100, 2)}%】</span>" if cost else ""
+    links = f"&nbsp;&nbsp;<a href='https://hk.finance.yahoo.com/quote/{yahoo_tk}' target='_blank' style='text-decoration:none; background:#eee; color:#333; padding:2px 8px; border-radius:12px; font-size:12px;'>Yahoo</a>&nbsp;<a href='https://tw.tradingview.com/chart/?symbol={tk}' target='_blank' style='text-decoration:none; background:#eee; color:#333; padding:2px 8px; border-radius:12px; font-size:12px;'>TradingView</a>"
+    
+    with st.expander(f"📌 {tk} {name}", expanded=(i==0)):
+        st.markdown(f"🕒 *分析時間: {d.get('timestamp', '未知')}* {pnl_tag} {links}", unsafe_allow_html=True)
+        if d.get('veto_alert') and d.get('veto_alert') != '無': 
+            st.error(f"🚫 否決條件觸發：{d['veto_alert']}")
+        
+        st.markdown(f"<h1 style='text-align:center;'>{d.get('total_score', '?')} / 100</h1>", unsafe_allow_html=True)
+        st.info(f"**操作建議：** {d.get('conclusion', '')}")
+        
+        c_left, c_right = st.columns([1, 1])
+        with c_left:
+            st.subheader("📊 給分細節")
+            for k, v in d.get('tech_breakdown', {}).items(): st.write(f"- **{k}**: {v}")
+            p = d.get('trading_plan', {})
+            st.warning(f"買區: {p.get('buy_zone')}\n\n停損: {p.get('stop_loss')}\n\n停利: {p.get('take_profit')}\n\n風報: {p.get('risk_reward_eval')}")
+            
+            copy_text = f"【{tk} {name}】波段診斷報告\n時間: {d.get('timestamp', '')}\n總分: {d.get('total_score', '')} / 100\n結論: {d.get('conclusion', '')}\n否決: {d.get('veto_alert', '無')}\n\n[實戰計畫]\n買區: {p.get('buy_zone')}\n停損: {p.get('stop_loss')}\n停利: {p.get('take_profit')}\n風報比: {p.get('risk_reward_eval')}"
+            st.markdown("<br>**📋 點擊右側圖示一鍵複製報告：**", unsafe_allow_html=True)
+            st.code(copy_text, language="markdown")
+            
+        with c_right:
+            radar_fig = plot_radar(d.get('radar_scores', []))
+            if radar_fig: st.plotly_chart(radar_fig, use_container_width=True, key=f"r_{i}")
+            
+            df_k = get_stock_data(yahoo_tk)
+            if df_k is not None:
+                k_fig = plot_kline(df_k, cost)
+                if k_fig: st.plotly_chart(k_fig, use_container_width=True, key=f"k_{i}")
+
+        st.write("---")
+        b1, b2, b3 = st.columns([1, 1, 2])
+        with b1:
+            if st.button("🔄 重新診斷", key=f"up_{i}", use_container_width=True):
+                target = f"{tk}@{cost}" if cost else tk
+                new_res = run_analysis(target)
+                if "error" not in new_res:
+                    st.session_state.db['manual_results'][i]['deep'] = new_res
+                    save_history(st.session_state.db['manual_results']); st.rerun()
+        with b2:
+            if st.button("❌ 刪除紀錄", key=f"del_{i}", use_container_width=True):
+                delete_record(i); st.rerun()
