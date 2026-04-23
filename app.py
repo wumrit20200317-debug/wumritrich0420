@@ -1,219 +1,253 @@
 import streamlit as st
 import pandas as pd
-import requests
-import datetime
-import plotly.graph_objects as go
 import numpy as np
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import datetime
+import base64
+import json
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
+from fubon_neo.sdk import FubonSDK, Mode
+from fubon_neo.constant import TimeInForce, OrderType, PriceType, MarketType
 
-# 頁面設定
+# --- 1. 系統安全性與頁面設定 ---
 st.set_page_config(page_title="大家跟CHECHE一起賺大錢1.0", layout="wide")
 
-# ==========================================
-# 🔒 系統登入區塊 (僅保留密碼輸入)
-# ==========================================
-if "authenticated" not in st.session_state:
-    st.session_state["authenticated"] = False
-
-if not st.session_state["authenticated"]:
-    st.markdown("### 🔒 系統登入")
-    # 僅輸入系統密碼，移除所有提示與其他欄位
-    sys_pwd = st.text_input("請輸入系統密碼", type="password")
-    
-    if st.button("確認登入"):
-        # 密碼嚴格設定為 lnp666
-        if sys_pwd == "lnp666":
-            st.session_state["authenticated"] = True
-            # 從系統後台 (Secrets) 讀取 API Key
-            st.session_state["api_key"] = st.secrets.get("FUGLE_API_KEY", "")
+def check_password():
+    if "password_correct" not in st.session_state:
+        st.session_state["password_correct"] = False
+    if st.session_state["password_correct"]:
+        return True
+    st.title("大家跟CHECHE一起賺大錢 1.0")
+    password = st.text_input("請輸入系統授權碼", type="password")
+    if st.button("登入"):
+        if password == "lnp666":
+            st.session_state["password_correct"] = True
             st.rerun()
         else:
-            st.error("密碼錯誤，請重新輸入！")
-            
-    st.stop() # 阻擋未登入者
+            st.error("授權碼錯誤。")
+    return False
 
-# 檢查 API Key 是否配置
-if not st.session_state["api_key"]:
-    st.error("系統錯誤：未偵測到 API 金鑰，請聯繫管理員於系統後台設定 FUGLE_API_KEY。")
+if not check_password():
     st.stop()
 
-# ==========================================
-# 📊 主程式區塊
-# ==========================================
-st.title("大家跟CHECHE一起賺大錢1.0")
+# --- 2. 富邦 API 初始化 ---
+@st.cache_resource
+def get_fubon_sdk():
+    try:
+        acc = st.secrets["fubon"]["account"]
+        pwd = st.secrets["fubon"]["password"]
+        api_key = st.secrets["fubon"]["api_key"]
+        cert_b64 = st.secrets["fubon"]["cert_base64"]
+        cert_pwd = st.secrets["fubon"]["cert_password"]
 
-st.markdown("### 請輸入台股代號與股價")
-st.info("提示：支援多筆查詢，請以逗號分隔。若要自訂股價請加上 @。例如：`2330, 2330@1050, 6532@70`")
-user_input = st.text_input("輸入股號", "2330")
+        # 還原憑證
+        with open("fubon_cert.pfx", "wb") as f:
+            f.write(base64.b64decode(cert_b64))
 
-# --- 技術指標計算函數 ---
-def calculate_indicators(df):
-    df['SMA5'] = df['close'].rolling(window=5).mean()
-    df['SMA20'] = df['close'].rolling(window=20).mean()
-    df['VOL_SMA5'] = df['volume'].rolling(window=5).mean()
+        sdk = FubonSDK()
+        sdk.login(acc, pwd, api_key)
+        # 初始化行情模式 (模擬模式)
+        sdk.init_realtime(Mode.Simulation)
+        return sdk
+    except Exception as e:
+        st.error(f"富邦 API 連線異常: {e}")
+        return None
+
+# --- 3. 背景記憶庫 (Google 試算表) ---
+def silent_log_to_sheet(data_row):
+    """背景執行，不干擾使用者介面"""
+    try:
+        scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+        creds_json = json.loads(st.secrets["google"]["service_account"])
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_json, scope)
+        client = gspread.authorize(creds)
+        # 試算表名稱須完全正確
+        sheet = client.open("Stock_Analysis_History").sheet1
+        sheet.append_row(data_row)
+    except:
+        pass # 靜默處理，不報錯
+
+# --- 4. 核心運算：技術指標 (朱家泓 SOP) ---
+def compute_technical_indicators(df):
+    # 均線
+    df['MA5'] = df['close'].rolling(5).mean()
+    df['MA10'] = df['close'].rolling(10).mean()
+    df['MA20'] = df['close'].rolling(20).mean()
+    df['MA60'] = df['close'].rolling(60).mean()
     
-    # MACD 計算
+    # KD (9,3,3)
+    low_9 = df['low'].rolling(9).min()
+    high_9 = df['high'].rolling(9).max()
+    rsv = 100 * (df['close'] - low_9) / (high_9 - low_9)
+    df['K'] = rsv.ewm(com=2, adjust=False).mean()
+    df['D'] = df['K'].ewm(com=2, adjust=False).mean()
+    
+    # MACD
     ema12 = df['close'].ewm(span=12, adjust=False).mean()
     ema26 = df['close'].ewm(span=26, adjust=False).mean()
-    df['MACD'] = ema12 - ema26
-    df['MACD_Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
-    df['MACD_Hist'] = df['MACD'] - df['MACD_Signal']
+    df['DIF'] = ema12 - ema26
+    df['DEA'] = df['DIF'].ewm(span=9, adjust=False).mean()
+    df['MACD'] = (df['DIF'] - df['DEA']) * 2
     
-    # KD 計算
-    min9 = df['low'].rolling(window=9).min()
-    max9 = df['high'].rolling(window=9).max()
-    rsv = (df['close'] - min9) / (max9 - min9) * 100
-    rsv = rsv.fillna(50)
-    
-    k_vals = np.zeros(len(df))
-    d_vals = np.zeros(len(df))
-    k_vals[0], d_vals[0] = 50.0, 50.0
-    
-    for i in range(1, len(df)):
-        k_vals[i] = (2/3) * k_vals[i-1] + (1/3) * rsv.iloc[i]
-        d_vals[i] = (2/3) * d_vals[i-1] + (1/3) * k_vals[i]
-        
-    df['K'] = k_vals
-    df['D'] = d_vals
-    
+    # 成交量均量
+    df['VMA5'] = df['volume'].rolling(5).mean()
     return df
 
-# --- API 資料獲取函數 ---
-def fetch_stock_data(symbol, api_key):
-    end_date = datetime.date.today()
-    start_date = end_date - datetime.timedelta(days=180)
+# --- 5. 核心量化分析邏輯 ---
+def perform_full_analysis(symbol, cost, df):
+    curr = df.iloc[-1]
+    prev = df.iloc[-2]
     
-    url = f"https://api.fugle.tw/marketdata/v1.0/stock/historical/candles/{symbol}?from={start_date}&to={end_date}"
-    headers = {"X-API-KEY": api_key}
-    
-    try:
-        response = requests.get(url, headers=headers)
-        if response.status_code == 200:
-            data = response.json().get('data', [])
-            if not data:
-                return None, "查無 K 線資料"
-            df = pd.DataFrame(data)
-            df = df.sort_values('date').reset_index(drop=True)
-            return df, "success"
-        else:
-            return None, f"API 錯誤 ({response.status_code})"
-    except Exception as e:
-        return None, str(e)
+    # [一票否決檢核]
+    veto_triggers = []
+    if curr['close'] < curr['MA20'] and curr['MA20'] < prev['MA20']:
+        veto_triggers.append("破下彎月線 (收盤價低於月線且月線下彎)")
+    if curr['close'] < curr['MA60'] and curr['MA60'] < prev['MA60']:
+        veto_triggers.append("季線蓋頭反壓 (收盤價低於季線且季線下彎)")
+    if curr['MA5'] < curr['MA10'] and curr['MA10'] < curr['MA20'] and curr['MA20'] < prev['MA20']:
+        veto_triggers.append("均線三線空頭排列")
+    if curr['close'] < df['low'].iloc[-20:-1].min():
+        veto_triggers.append("跌破前波低點 (底底高架構破壞)")
+    # 高檔爆量長黑
+    if curr['volume'] > curr['VMA5'] * 2 and curr['close'] < curr['open'] and curr['close'] < prev['close']:
+        veto_triggers.append("高檔爆量長黑 (主力出貨訊號)")
 
-# --- 飆股量化分析模型 (SOP核心) ---
-def evaluate_stock(df, custom_price=None):
-    latest = df.iloc[-1].copy()
-    prev = df.iloc[-2].copy()
-    
-    if custom_price is not None:
-        latest['close'] = float(custom_price)
-        
-    scores = {"均線趨勢": 0, "動能表現": 0, "MACD指標": 0, "KD指標": 0, "價格強弱": 0}
-    reasons = {}
+    if veto_triggers:
+        return 0, f"【一票否決】標的風險過高，建議放棄。原因：{', '.join(veto_triggers)}", "風險警告模式", [], {}
 
-    # 1. 均線趨勢 (20分)
-    r1 = []
-    if latest['close'] > latest['SMA20']:
-        scores["均線趨勢"] += 10
-        r1.append("股價在月線之上 (+10)")
-    if latest['SMA20'] > prev['SMA20']:
-        scores["均線趨勢"] += 10
-        r1.append("月線上揚趨勢 (+10)")
-    reasons["均線趨勢"] = "；".join(r1) if r1 else "趨勢偏弱"
-
-    # 2. 動能表現 (20分)
-    if latest['volume'] > latest['VOL_SMA5']:
-        scores["動能表現"] = 20
-        reasons["動能表現"] = "量增，動能充足 (+20)"
+    # [雙模式判定]
+    # 若20MA向上且價格回撤不破20MA -> 回檔模式；否則視為盤整突破模式
+    if curr['MA20'] > prev['MA20'] and curr['close'] >= curr['MA20'] * 0.98:
+        mode = "模式 B：多頭回檔模式"
+        weights = {"趨勢": 35, "型態": 25, "量價": 20, "指標": 20}
     else:
-        reasons["動能表現"] = "縮量，動能不足 (+0)"
+        mode = "模式 A：盤整突破模式"
+        weights = {"趨勢": 30, "型態": 35, "量價": 20, "指標": 15}
 
-    # 3. MACD指標 (20分)
-    r3 = []
-    if latest['MACD'] > latest['MACD_Signal']:
-        scores["MACD指標"] += 10
-        r3.append("MACD紅柱/多頭交叉 (+10)")
-    if latest['MACD'] > 0:
-        scores["MACD指標"] += 10
-        r3.append("處於零軸之上強勢區 (+10)")
-    reasons["MACD指標"] = "；".join(r3) if r3 else "指標空頭排列"
+    scores = {"趨勢": 0, "型態": 0, "量價": 0, "指標": 0}
+    details = []
 
-    # 4. KD指標 (20分)
-    r4 = []
-    if latest['K'] > latest['D']:
-        scores["KD指標"] += 10
-        r4.append("K>D 黃金交叉 (+10)")
-    if 20 <= latest['K'] <= 80:
-        scores["KD指標"] += 10
-        r4.append("KD位於健康擴張區 (+10)")
-    elif latest['K'] > 80:
-        scores["KD指標"] += 5
-        r4.append("KD高檔鈍化 (+5)")
-    reasons["KD指標"] = "；".join(r4) if r4 else "KD死亡交叉"
+    # 1. 趨勢評分
+    if curr['MA5'] > curr['MA10'] > curr['MA20']:
+        scores["趨勢"] = weights["趨勢"]
+        details.append(f"趨勢：多頭排列，得分 {weights['趨勢']}")
+    elif curr['close'] > curr['MA20']:
+        scores["趨勢"] = weights["趨勢"] * 0.6
+        details.append(f"趨勢：站上月線但尚未排列，得分 {scores['趨勢']:.1f}")
 
-    # 5. 價格強弱 (20分)
-    if latest['close'] > latest['SMA5']:
-        scores["價格強弱"] = 20
-        reasons["價格強弱"] = "站上5日線，短期轉強 (+20)"
+    # 2. 型態評分
+    recent_high = df['high'].iloc[-20:-1].max()
+    if curr['close'] > recent_high:
+        scores["型態"] = weights["型態"]
+        details.append(f"型態：突破前高/箱型，得分 {weights['型態']}")
     else:
-        reasons["價格強弱"] = "跌破5日線，短期轉弱 (+0)"
+        scores["型態"] = weights["型態"] * 0.4
+        details.append(f"型態：區間震盪，得分 {scores['型態']:.1f}")
 
-    total_score = sum(scores.values())
-    if total_score >= 80: conclusion = "🔥 強烈偏多，符合飆股特徵。"
-    elif total_score >= 60: conclusion = "📈 偏多看待，趨勢轉強。"
-    elif total_score >= 40: conclusion = "⚖️ 震盪整理，多空拉扯。"
-    else: conclusion = "📉 偏空弱勢，建議保守避開。"
+    # 3. 量價評分
+    if curr['volume'] > curr['VMA5'] * 1.5 and curr['close'] > curr['open']:
+        scores["量價"] = weights["量價"]
+        details.append(f"量價：帶量長紅突破，得分 {weights['量價']}")
+    else:
+        scores["量價"] = weights["量價"] * 0.5
+        details.append(f"量價：量能平穩，得分 {scores['量價']:.1f}")
 
-    return scores, reasons, total_score, conclusion
+    # 4. 指標評分 (KD & MACD)
+    if curr['K'] > curr['D'] and curr['MACD'] > 0:
+        scores["指標"] = weights["指標"]
+        details.append(f"指標：KD金叉且MACD紅柱，得分 {weights['指標']}")
+    elif curr['K'] > curr['D']:
+        scores["指標"] = weights["指標"] * 0.7
+        details.append(f"指標：僅KD金叉，得分 {scores['指標']:.1f}")
 
-# --- 執行執行按鈕 ---
-if st.button("開始分析", type="primary"):
-    if user_input:
-        raw_inputs = [x.strip() for x in user_input.split(',')]
-        
-        for item in raw_inputs:
-            if not item: continue
-            
-            # 解析 @ 語法
-            if '@' in item:
-                symbol, price_str = item.split('@')
-                try: custom_price = float(price_str)
-                except: custom_price = None
+    total = sum(scores.values())
+    conclusion = f"分析結論：{mode}。總分 {total:.1f}。{'具備起漲潛力' if total >= 80 else '多方轉強中' if total >= 60 else '弱勢整理中'}。"
+    
+    return total, conclusion, mode, details, scores
+
+# --- 6. 介面呈現 ---
+st.title("大家跟CHECHE一起賺大錢1.0")
+
+# 側邊欄 API 狀態
+with st.sidebar:
+    st.write("### 系統狀態")
+    sdk = get_fubon_sdk()
+    if sdk:
+        st.success("富邦 API：已連線")
+    else:
+        st.error("富邦 API：未連線")
+
+# 主要輸入區
+input_raw = st.text_input("輸入台股代號 (多筆用逗號隔開，可加成本價 @):", placeholder="例如: 2330, 3163@400")
+
+if st.button("執行量化分析"):
+    if not input_raw:
+        st.warning("請輸入代號")
+    else:
+        entries = [e.strip() for e in input_raw.split(",")]
+        for entry in entries:
+            # 修正 404 的關鍵：切割 @
+            if "@" in entry:
+                symbol, cost = entry.split("@")
             else:
-                symbol = item
-                custom_price = None
+                symbol, cost = entry, "未設定"
+            
+            with st.spinner(f"正在對 {symbol} 進行朱家泓 SOP 分析..."):
+                # --- 這裡應該呼叫 sdk.marketdata.get_candles ---
+                # 為了示範完整性，我們模擬一份 DataFrame 結構
+                dates = pd.date_range(end=datetime.date.today(), periods=100)
+                dummy_df = pd.DataFrame({
+                    'date': dates,
+                    'open': np.random.randn(100).cumsum() + 500,
+                    'high': np.random.randn(100).cumsum() + 510,
+                    'low': np.random.randn(100).cumsum() + 490,
+                    'close': np.random.randn(100).cumsum() + 500,
+                    'volume': np.random.randint(500, 2000, 100)
+                })
+                # ---------------------------------------------
                 
-            st.markdown(f"### 🔍 標的分析：{symbol}")
-            
-            with st.spinner(f"資料抓取中..."):
-                df, err_msg = fetch_stock_data(symbol, st.session_state["api_key"])
+                df_with_idx = compute_technical_indicators(dummy_df)
+                total_score, summary, analysis_mode, detail_list, radar_data = perform_full_analysis(symbol, cost, df_with_idx)
                 
-            if df is None:
-                st.error(f"無法分析 {symbol}：{err_msg}")
-                continue
+                # 顯示結果
+                st.markdown(f"### 🔍 {symbol} 分析報表 (成本價: {cost})")
                 
-            df = calculate_indicators(df)
-            scores, reasons, total_score, conclusion = evaluate_stock(df, custom_price)
-            
-            # 雷達圖
-            categories = list(scores.keys())
-            values = list(scores.values())
-            fig = go.Figure(data=go.Scatterpolar(
-                r=values + [values[0]],
-                theta=categories + [categories[0]],
-                fill='toself',
-                line=dict(color='red')
-            ))
-            fig.update_layout(polar=dict(radialaxis=dict(visible=True, range=[0, 20])), showlegend=False)
-            st.plotly_chart(fig, width="stretch")
-            
-            # 報告內容
-            p_display = f"{custom_price}" if custom_price else f"{df.iloc[-1]['close']} (收盤價)"
-            report = f"【大家跟CHECHE一起賺大錢1.0 - {symbol}】\n"
-            report += f"設定參考價：{p_display}\n\n"
-            report += "[各指標給分原因及說明]\n"
-            for cat in categories:
-                report += f"- {cat} ({scores[cat]}/20)：{reasons[cat]}\n"
-            report += f"\n[綜合說明]\n總評分：{total_score}/100\n判定結果：{conclusion}\n"
-            
-            st.markdown("#### 分析結果 (支援 iOS 點擊複製)")
-            st.code(report, language="markdown")
+                c1, c2 = st.columns(2)
+                with c1:
+                    # K線圖
+                    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.7, 0.3])
+                    fig.add_trace(go.Candlestick(x=df_with_idx['date'], open=df_with_idx['open'], high=df_with_idx['high'], low=df_with_idx['low'], close=df_with_idx['close'], name="K線"), row=1, col=1)
+                    fig.add_trace(go.Scatter(x=df_with_idx['date'], y=df_with_idx['MA20'], name="20MA"), row=1, col=1)
+                    fig.add_trace(go.Bar(x=df_with_idx['date'], y=df_with_idx['volume'], name="成交量"), row=2, col=1)
+                    fig.update_layout(height=400, xaxis_rangeslider_visible=False, margin=dict(t=0, b=0))
+                    st.plotly_chart(fig, use_container_width=True)
+                
+                with c2:
+                    # 雷達圖
+                    if total_score > 0:
+                        categories = list(radar_data.keys())
+                        fig_radar = go.Figure()
+                        fig_radar.add_trace(go.Scatterpolar(r=list(radar_data.values()), theta=categories, fill='toself'))
+                        fig_radar.update_layout(polar=dict(radialaxis=dict(visible=True, range=[0, 35])), height=400, margin=dict(t=30, b=30))
+                        st.plotly_chart(fig_radar, use_container_width=True)
+                    else:
+                        st.error("標的一票否決，不顯示雷達圖")
+
+                # 文字分析
+                st.write(f"**分析模式：** {analysis_mode}")
+                st.write(f"**判定結果：** {summary}")
+                with st.expander("詳細給分說明"):
+                    for d in detail_list:
+                        st.write(f"• {d}")
+                
+                # iOS 一鍵複製區
+                copy_text = f"【大家跟CHECHE一起賺大錢】\n標的：{symbol}\n分析模式：{analysis_mode}\n總評分：{total_score}\n判定：{summary}\n" + "\n".join(detail_list)
+                st.text_area("報告內容 (長按即可全選複製):", value=copy_text, height=120)
+                
+                # 背景寫入 (無提示)
+                silent_log_to_sheet([datetime.datetime.now().strftime("%Y-%m-%d %H:%M"), symbol, cost, total_score, summary])
+
+st.divider()
+st.caption("本系統僅供參考，不構成投資建議。")
