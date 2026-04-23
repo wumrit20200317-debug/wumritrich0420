@@ -3,7 +3,6 @@ google-generativeai
 plotly
 pandas
 numpy
-gspread
-oauth2client
 beautifulsoup4
-fubon_neo
+oauth2client
+fubon_neo-2.2.8-cp37-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
