@@ -3,4 +3,4 @@ pandas
 ./fubon_neo-2.2.8-cp37-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
 gspread
 google-auth
-pandas-ta==0.3.14b0
+git+https://github.com/twopirllc/pandas-ta.git@main
