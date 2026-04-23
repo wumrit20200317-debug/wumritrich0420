@@ -62,12 +62,15 @@ if not os.path.exists(cert_path):
 if "fubon_sdk" not in st.session_state:
     try:
         sdk = FubonSDK()
-        res = sdk.init(fubon_user, fubon_pass, cert_path, cert_pass)
-        if res:
+        # 修正：富邦官方 SDK 的登入函式為 login()，非 init()
+        res = sdk.login(fubon_user, fubon_pass, cert_path, cert_pass)
+        
+        # 官方回傳格式包含 is_success 屬性
+        if res.is_success:
             st.session_state.fubon_sdk = sdk
             st.sidebar.success("✅ 富邦 API 連線成功")
         else:
-            st.sidebar.error("❌ 富邦登入失敗")
+            st.sidebar.error(f"❌ 富邦登入失敗: {res.message}")
             st.stop()
     except Exception as e:
         st.sidebar.error(f"API 異常: {e}")
@@ -206,6 +209,9 @@ if analyze_btn:
                 record = [today_str, stock_id, total_score, full_reason]
                 if save_to_google_sheets(record):
                     st.success("✅ 分析完成！數據與判定理由已寫入 Google 試算表。")
+                    
+            else:
+                 st.warning("⚠️ 無法獲取 K 線資料，請確認台股代號是否正確。")
 
         except Exception as e:
             st.error(f"分析過程發生錯誤: {e}")
