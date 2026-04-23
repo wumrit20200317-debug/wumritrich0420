@@ -1,6 +1,6 @@
 streamlit
-pandas
+pandas==2.1.4
+numpy==1.26.4
 ./fubon_neo-2.2.8-cp37-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
-numpy
 requests
-pandas-ta
+pandas-ta==0.3.14b0
