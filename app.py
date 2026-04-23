@@ -20,7 +20,7 @@ try:
 except ImportError:
     GSHEET_AVAILABLE = False
 
-# 富邦 SDK 
+# 富邦 SDK (防呆：若環境無安裝不會當機)
 try:
     from fubon_neo.sdk import FubonSDK, Mode
     FUBON_AVAILABLE = True
@@ -85,14 +85,15 @@ if 'key_pool' not in st.session_state:
 
 # 富邦狀態偵測
 fubon_cfg = get_secret_val("fubon")
-fubon_status = "🟢 已連線" if fubon_cfg else "🔴 未連線 (Secret 缺失)"
+fubon_status = "🟢 已讀取金鑰配置" if fubon_cfg else "🔴 未設定 Secrets"
+if not FUBON_AVAILABLE: fubon_status = "🟡 未安裝富邦套件 (防呆模式運行中)"
 
 with st.sidebar:
     st.header("🔌 系統狀態")
     st.write(f"富邦 API：{fubon_status}")
     if not fubon_cfg: st.caption("請確認 Secrets 中有 [fubon] 區塊")
 
-# 本地暫存 (解決休眠前當次使用的顯示問題)
+# 本地暫存 
 if 'db' not in st.session_state:
     st.session_state.db = {"manual_results": []}
 
@@ -111,7 +112,6 @@ def write_to_gsheet_silent(data):
         client = gspread.authorize(creds)
         sheet = client.open_by_url(sheet_url).sheet1
         
-        # 整理要寫入的欄位 (時間, 代號, 名稱, 成本, 現價, 總分, 否決條件, AI結論)
         row = [
             data.get('timestamp', ''),
             data.get('resolved_ticker', ''),
@@ -124,8 +124,7 @@ def write_to_gsheet_silent(data):
         ]
         sheet.append_row(row)
     except Exception as e:
-        # 靜默失敗，不干擾使用者主流程
-        pass
+        pass # 靜默失敗，不干擾使用者主流程
 
 # ==========================================
 # 4. 數據與計算引擎 (yfinance)
@@ -185,20 +184,36 @@ def calculate_ta(df):
 def get_scores(ta):
     scores = {"MA": 0, "Pattern": 0, "Vol": 0, "KD": 0}
     vetos = []
+    breakdown = {}
     
     # 否決邏輯
     if ta['C'] < ta['MAs'][1] and ta['T20'] == 0: vetos.append("股價跌破月線且下彎")
     if ta['C'] < ta['L20']: vetos.append("股價跌破前波低點")
     
-    # 給分原因 (100滿分配置)
-    if ta['C'] > ta['MAs'][0]: scores["MA"] = 25
-    if ta['Vol'] > ta['Vol5']: scores["Vol"] = 25
-    if ta['K'] > ta['D']: scores["KD"] = 25
-    if ta['C'] >= ta['H20'] * 0.95: scores["Pattern"] = 25
+    # 給分原因與細節
+    if ta['C'] > ta['MAs'][0]: 
+        scores["MA"] = 25; breakdown["均線"] = "站上5日線，短線強勢"
+    else: 
+        breakdown["均線"] = "跌破短均線，動能偏弱"
+        
+    if ta['Vol'] > ta['Vol5']: 
+        scores["Vol"] = 25; breakdown["價量"] = "出量攻擊，動能充沛"
+    else: 
+        breakdown["價量"] = "量縮整理"
+        
+    if ta['K'] > 50: 
+        scores["KD"] = 25; breakdown["指標"] = "KD指標於50之上多方區"
+    else: 
+        breakdown["指標"] = "指標偏弱整理"
+        
+    if ta['C'] >= ta['H20'] * 0.95: 
+        scores["Pattern"] = 25; breakdown["型態"] = "逼近20日高點，具突破契機"
+    else: 
+        breakdown["型態"] = "處於區間震盪或弱勢整理"
     
     total = sum(scores.values())
     radar = [scores["MA"], scores["Pattern"], 10, scores["Vol"], 10, 10, scores["KD"], 10]
-    return total, radar, vetos
+    return total, radar, vetos, breakdown
 
 # ==========================================
 # 5. AI 調度 (Gemini 引擎)
@@ -259,7 +274,7 @@ if st.button("🚀 啟動診斷", type="primary", use_container_width=True):
             df = get_stock_data(tk)
             if df is not None:
                 ta = calculate_ta(df)
-                total_s, radar_s, vetos = get_scores(ta)
+                total_s, radar_s, vetos, bkdown = get_scores(ta)
                 name = get_chinese_name(tk)
                 
                 mini_prompt = f'{{"T":"{tk}","C":{ta["C"]},"Score":{total_s},"Vetos":{vetos}}}'
@@ -268,37 +283,38 @@ if st.button("🚀 啟動診斷", type="primary", use_container_width=True):
                 res_data = {
                     "resolved_ticker": tk, "stock_name": name, "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                     "total_score": total_s, "radar_scores": radar_s, "veto_alert": "；".join(vetos) if vetos else "無", 
+                    "tech_breakdown": bkdown,
                     "current_price": ta['C'], "cost_price": cost,
                     "conclusion": ai_res.get("conclusion", ""), "trading_plan": ai_res.get("trading_plan", {})
                 }
                 
-                # 1. 存入本地畫面顯示
                 st.session_state.db["manual_results"].insert(0, res_data)
-                # 2. 靜默寫入 Google 試算表 (做為永久回測留存)
                 write_to_gsheet_silent(res_data)
                 
         st.rerun()
 
 # 顯示紀錄
 for i, item in enumerate(st.session_state.db["manual_results"]):
-    tk, name, cost, price = item['resolved_ticker'], item['stock_name'], item['cost_price'], item['current_price']
+    tk, name, cost, price = item['resolved_ticker'], item['stock_name'], item.get('cost_price'), item['current_price']
     pnl_tag = f"&nbsp;&nbsp;<span style='color:{'#ff4b4b' if price>=cost else '#00cc96'}; font-weight:bold;'>【帳面: {'+' if price>=cost else ''}{round((price-cost)/cost*100, 2)}%】</span>" if cost else ""
     
     with st.expander(f"📌 {tk} {name} (現價: {price})", expanded=(i==0)):
         st.markdown(f"🕒 *時間: {item['timestamp']}* {pnl_tag}", unsafe_allow_html=True)
         
-        if item['veto_alert'] != "無": st.error(f"🚫 否決條件：{item['veto_alert']}")
+        if item.get('veto_alert') and item['veto_alert'] != "無": st.error(f"🚫 否決條件：{item['veto_alert']}")
         st.markdown(f"<h1 style='text-align:center;'>{item['total_score']} / 100</h1>", unsafe_allow_html=True)
         st.info(f"**📝 綜合說明：** {item['conclusion']}")
         
         c_left, c_right = st.columns([1, 1])
         with c_left:
-            p = item['trading_plan']
+            st.subheader("📊 給分原因與細節")
+            for k, v in item.get('tech_breakdown', {}).items(): st.write(f"- **{k}**: {v}")
+            
+            p = item.get('trading_plan', {})
             if p:
                 st.warning(f"買區: {p.get('buy_zone')}\n\n停損: {p.get('stop_loss')}\n\n停利: {p.get('take_profit')}\n\n風報: {p.get('risk_reward_eval')}")
             
-            # 一鍵複製 (去除贅字)
-            copy_txt = f"代號: {tk} {name}\n總分: {item['total_score']}\n現價: {price}\n說明: {item['conclusion']}\n否決: {item['veto_alert']}"
+            copy_txt = f"代號: {tk} {name}\n總分: {item['total_score']} / 100\n現價: {price}\n說明: {item['conclusion']}\n否決: {item['veto_alert']}"
             st.markdown("<br>**📋 長按全選複製報告：**", unsafe_allow_html=True)
             st.code(copy_txt, language="markdown")
             
