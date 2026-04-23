@@ -1,8 +1,9 @@
 streamlit
-yfinance
+google-generativeai
 plotly
 pandas
 numpy
-google-generativeai
 gspread
 oauth2client
+beautifulsoup4
+fubon_neo
