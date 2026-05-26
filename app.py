@@ -1,8 +1,8 @@
 import streamlit as st
 import time
 import json
-import google.generativeai as genai
-import yfinance as yf
+from google import genai
+from google.genai import types
 import plotly.graph_objects as go
 import os
 import pandas as pd
@@ -40,17 +40,17 @@ if not check_password():
     st.stop()
 
 # ==========================================
-# 2. 富邦 API 初始化與連線
+# 2. 富邦 API 初始化與連線 
 # ==========================================
 def init_fubon():
     if "fubon_sdk" not in st.session_state:
         try:
-            if "fubon" in st.secrets:
-                cert_content = base64.b64decode(st.secrets["fubon"]["cert_base64"])
+            if "FUBON_USER" in st.secrets:
+                cert_content = base64.b64decode(st.secrets["FUBON_CERT_BASE64"])
                 with open("fubon_cert.pfx", "wb") as f:
                     f.write(cert_content)
                 sdk = FubonSDK()
-                sdk.login(st.secrets["fubon"]["id"], st.secrets["fubon"]["password"], "fubon_cert.pfx", st.secrets["fubon"]["cert_password"])
+                sdk.login(st.secrets["FUBON_USER"], st.secrets["FUBON_PASS"], "fubon_cert.pfx", st.secrets["CERT_PASS"])
                 st.session_state.fubon_sdk = sdk
                 st.session_state.fubon_status = "🟢 富邦 API 已連線"
             else:
@@ -61,7 +61,7 @@ def init_fubon():
 init_fubon()
 
 # ==========================================
-# 3. 智能調度中心 (5把 API 最省邏輯)
+# 3. 智能調度中心 (API 最省邏輯)
 # ==========================================
 try:
     raw_keys = st.secrets["api_keys"]
@@ -101,13 +101,14 @@ def delete_record(index):
         save_history(st.session_state.db['manual_results'])
 
 # ==========================================
-# 4. 爬蟲與大數據精算
+# 4. 爬蟲與大數據精算 (替換為富邦 API)
 # ==========================================
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_top_50_volume():
     try:
         url = "https://tw.stock.yahoo.com/rank/volume"
-        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
+        req = urllib.request.Request(url, headers=headers)
         html = urllib.request.urlopen(req, timeout=5).read().decode('utf-8')
         matches = re.findall(r'href="/quote/(\d{4,5})', html)
         tickers = list(dict.fromkeys(matches))[:50]
@@ -118,7 +119,7 @@ def get_top_50_volume():
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_chinese_name(tk):
     try:
-        headers = {'User-Agent': 'Mozilla/5.0'}
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
         url = f"https://tw.stock.yahoo.com/quote/{tk}" if tk.isdigit() else f"https://hk.finance.yahoo.com/quote/{tk}"
         req = urllib.request.Request(url, headers=headers)
         html = urllib.request.urlopen(req, timeout=3).read().decode('utf-8')
@@ -129,20 +130,80 @@ def get_chinese_name(tk):
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_stock_data(ticker):
-    try: 
-        df = yf.Ticker(ticker).history(period="1y")
-        if df is None or df.empty or len(df) < 60: 
-            return None
+    # 💯 核心修改：使用富邦 API 抓取歷史 K 線資料
+    if "fubon_sdk" not in st.session_state or st.session_state.fubon_sdk is None:
+        return None
+    try:
+        sdk = st.session_state.fubon_sdk
+        reststock = sdk.marketdata.rest_client.stock
+        
+        end_date = datetime.now().strftime("%Y-%m-%d")
+        start_date = (datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d")
+        
+        symbol = ticker.replace('.TW', '').replace('.TWO', '')
+        response = reststock.historical.candles(**{"symbol": symbol, "from": start_date, "to": end_date})
+        
+        if hasattr(response, 'get') and 'data' in response: data = response['data']
+        elif isinstance(response, list): data = response
+        else: data = response
+            
+        df = pd.DataFrame(data)
+        if df.empty: return None
+        
+        rename_map = {}
+        for col in df.columns:
+            if col.lower() == 'date': rename_map[col] = 'Date'
+            elif col.lower() == 'open': rename_map[col] = 'Open'
+            elif col.lower() == 'high': rename_map[col] = 'High'
+            elif col.lower() == 'low': rename_map[col] = 'Low'
+            elif col.lower() == 'close': rename_map[col] = 'Close'
+            elif col.lower() == 'volume': rename_map[col] = 'Volume'
+            
+        df.rename(columns=rename_map, inplace=True)
+        df['Date'] = pd.to_datetime(df['Date'])
+        df.set_index('Date', inplace=True)
+        df.sort_index(ascending=True, inplace=True)
+        
+        if len(df) < 60: return None
         return df
-    except Exception: 
+    except Exception:
         return None
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_market_return(is_tw):
+    # 💯 核心修改：使用富邦 API 抓取台灣加權指數 (IX0001)
+    if "fubon_sdk" not in st.session_state or st.session_state.fubon_sdk is None:
+        return 0
     try:
-        df = yf.Ticker("^TWII" if is_tw else "^GSPC").history(period="1mo")
-        return (df['Close'].iloc[-1] - df['Close'].iloc[-10]) / df['Close'].iloc[-10] * 100
-    except: return 0
+        sdk = st.session_state.fubon_sdk
+        reststock = sdk.marketdata.rest_client.stock
+        
+        end_date = datetime.now().strftime("%Y-%m-%d")
+        start_date = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
+        symbol = "IX0001" 
+        
+        response = reststock.historical.candles(**{"symbol": symbol, "from": start_date, "to": end_date})
+        
+        if hasattr(response, 'get') and 'data' in response: data = response['data']
+        elif isinstance(response, list): data = response
+        else: data = response
+            
+        df = pd.DataFrame(data)
+        if df.empty or len(df) < 10: return 0
+            
+        close_col = [c for c in df.columns if c.lower() == 'close']
+        date_col = [c for c in df.columns if c.lower() == 'date']
+        
+        if date_col:
+            df[date_col[0]] = pd.to_datetime(df[date_col[0]])
+            df.sort_values(date_col[0], ascending=True, inplace=True)
+            
+        if close_col:
+            closes = df[close_col[0]]
+            return (closes.iloc[-1] - closes.iloc[-10]) / closes.iloc[-10] * 100
+        return 0
+    except Exception: 
+        return 0
 
 def calculate_technical_data(df, market_ret):
     try:
@@ -251,7 +312,7 @@ def get_python_scores(ta):
     return total, radar, breakdown, veto_str
 
 # ==========================================
-# 6. 核心調度 (5把 API 最省使用法)
+# 6. 核心調度 (Gemini API)
 # ==========================================
 SYS_INSTRUCT = """你是朱家泓波段長。以下是客觀技術分數(滿分100)。
 請嚴格回傳純JSON。鍵值：{"trading_plan":{"buy_zone":"建議買區","stop_loss":"停損價位","take_profit":"停利預估","risk_reward_eval":"風報比簡評"}, "conclusion":"綜合操作建議"}"""
@@ -275,10 +336,17 @@ def safe_generate_content(prompt_data):
             if wait_sec > 0:
                 st.toast(f"💤 引擎冷卻中，等待 {int(wait_sec)} 秒..."); time.sleep(wait_sec); continue
         
-        genai.configure(api_key=API_KEYS[healthy_idx])
-        model = genai.GenerativeModel('gemini-2.5-flash', system_instruction=SYS_INSTRUCT)
+        client = genai.Client(api_key=API_KEYS[healthy_idx])
         try:
-            return model.generate_content(prompt_data, generation_config=genai.types.GenerationConfig(temperature=0.0))
+            res = client.models.generate_content(
+                model='gemini-2.5-flash',
+                contents=prompt_data,
+                config=types.GenerateContentConfig(
+                    system_instruction=SYS_INSTRUCT,
+                    temperature=0.0
+                )
+            )
+            return res
         except Exception as e:
             st.session_state.key_pool[healthy_idx] = datetime.now() + timedelta(seconds=60)
             if "429" in str(e).lower() or "quota" in str(e).lower(): st.toast(f"⚠️ 引擎 {healthy_idx+1} 流量限制...")
@@ -290,15 +358,12 @@ def run_analysis(ticker_input):
     try:
         tk, cost = (ticker_input.split("@")[0].strip().upper(), float(ticker_input.split("@")[1].strip())) if "@" in ticker_input else (ticker_input.strip().upper(), None)
         
-        yahoo_tk = tk + ".TW" if tk.isdigit() else tk
-        df = get_stock_data(yahoo_tk)
-        if df is None and tk.isdigit(): 
-            yahoo_tk = tk + ".TWO"
-            df = get_stock_data(yahoo_tk)
+        # 直接使用裸代號透過富邦 API 抓取
+        df = get_stock_data(tk)
         
-        if df is None: return {"error": "無法取得報價資料 (可能是剛掛牌、輸入錯誤或已下市)"}
-        ta = calculate_technical_data(df, get_market_return(".TW" in tk or ".TWO" in tk))
-        if ta is None: return {"error": "指標運算異常 (可能是歷史資料不足 60 日)"}
+        if df is None: return {"error": "無法取得報價資料 (請確認富邦API連線，或K線資料不足60日)"}
+        ta = calculate_technical_data(df, get_market_return(True))
+        if ta is None: return {"error": "指標運算異常 (歷史資料處理失敗)"}
         
         chinese_name = get_chinese_name(tk)
         total_score, radar_array, py_breakdown, py_veto = get_python_scores(ta)
@@ -311,6 +376,9 @@ def run_analysis(ticker_input):
             parsed = json.loads(raw[raw.find('{'):raw.rfind('}')+1])
         except Exception as e:
             return {"error": f"AI 回傳格式解析失敗: {str(e)}"}
+            
+        # UI 外部連結專用
+        yahoo_tk = tk + ".TW" if tk.isdigit() else tk
             
         parsed.update({
             'tech_breakdown': py_breakdown,
@@ -439,7 +507,7 @@ for i, item in enumerate(st.session_state.db['manual_results']):
             radar_fig = plot_radar(d.get('radar_scores', []))
             if radar_fig: st.plotly_chart(radar_fig, use_container_width=True, key=f"r_{i}")
             
-            df_k = get_stock_data(yahoo_tk)
+            df_k = get_stock_data(tk) # 使用富邦 API 直接獲取繪圖用資料
             if df_k is not None:
                 k_fig = plot_kline(df_k, cost)
                 if k_fig: st.plotly_chart(k_fig, use_container_width=True, key=f"k_{i}")
