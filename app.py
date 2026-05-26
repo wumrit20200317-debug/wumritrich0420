@@ -101,16 +101,25 @@ def delete_record(index):
         save_history(st.session_state.db['manual_results'])
 
 # ==========================================
-# 4. 爬蟲與大數據精算 (替換為富邦 API)
+# 4. 爬蟲與大數據精算 (富邦 API 解析優化版)
 # ==========================================
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_top_50_volume():
     try:
         url = "https://tw.stock.yahoo.com/rank/volume"
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'zh-TW,zh;q=0.8,en-US;q=0.5,en;q=0.3'
+        }
         req = urllib.request.Request(url, headers=headers)
         html = urllib.request.urlopen(req, timeout=5).read().decode('utf-8')
-        matches = re.findall(r'href="/quote/(\d{4,5})', html)
+        
+        # 針對 Yahoo 動態網頁，直接暴力萃取代碼
+        matches = re.findall(r'/quote/(\d{4,5})', html)
+        if not matches:
+            matches = re.findall(r'symbol=(\d{4,5})', html)
+            
         tickers = list(dict.fromkeys(matches))[:50]
         return tickers
     except Exception:
@@ -130,7 +139,6 @@ def get_chinese_name(tk):
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_stock_data(ticker):
-    # 💯 核心修改：使用富邦 API 抓取歷史 K 線資料
     if "fubon_sdk" not in st.session_state or st.session_state.fubon_sdk is None:
         return None
     try:
@@ -139,15 +147,39 @@ def get_stock_data(ticker):
         
         end_date = datetime.now().strftime("%Y-%m-%d")
         start_date = (datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d")
-        
         symbol = ticker.replace('.TW', '').replace('.TWO', '')
-        response = reststock.historical.candles(**{"symbol": symbol, "from": start_date, "to": end_date})
         
-        if hasattr(response, 'get') and 'data' in response: data = response['data']
-        elif isinstance(response, list): data = response
-        else: data = response
+        # 安全 API 調用：處理 from 關鍵字衝突與富邦特有參數
+        try:
+            response = reststock.historical.candles(symbol=symbol, from_=start_date, to_=end_date, timeframe="D")
+        except TypeError:
+            try:
+                response = reststock.historical.candles(**{"symbol": symbol, "from": start_date, "to": end_date, "timeframe": "D"})
+            except Exception:
+                return None
+        
+        # 安全資料解析：處理 Fubon Pydantic 物件與一般 Dict 差異
+        if hasattr(response, 'data'):
+            data = response.data
+        elif isinstance(response, dict) and 'data' in response:
+            data = response['data']
+        else:
+            data = response
             
-        df = pd.DataFrame(data)
+        if not data: return None
+        
+        parsed_data = []
+        for item in data:
+            if isinstance(item, dict):
+                parsed_data.append(item)
+            elif hasattr(item, 'dict'):
+                parsed_data.append(item.dict())
+            elif hasattr(item, '__dict__'):
+                parsed_data.append(vars(item))
+            else:
+                parsed_data.append(item)
+                
+        df = pd.DataFrame(parsed_data)
         if df.empty: return None
         
         rename_map = {}
@@ -160,6 +192,8 @@ def get_stock_data(ticker):
             elif col.lower() == 'volume': rename_map[col] = 'Volume'
             
         df.rename(columns=rename_map, inplace=True)
+        if 'Date' not in df.columns: return None
+        
         df['Date'] = pd.to_datetime(df['Date'])
         df.set_index('Date', inplace=True)
         df.sort_index(ascending=True, inplace=True)
@@ -171,7 +205,6 @@ def get_stock_data(ticker):
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_market_return(is_tw):
-    # 💯 核心修改：使用富邦 API 抓取台灣加權指數 (IX0001)
     if "fubon_sdk" not in st.session_state or st.session_state.fubon_sdk is None:
         return 0
     try:
@@ -182,13 +215,31 @@ def get_market_return(is_tw):
         start_date = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
         symbol = "IX0001" 
         
-        response = reststock.historical.candles(**{"symbol": symbol, "from": start_date, "to": end_date})
+        try:
+            response = reststock.historical.candles(symbol=symbol, from_=start_date, to_=end_date, timeframe="D")
+        except TypeError:
+            try:
+                response = reststock.historical.candles(**{"symbol": symbol, "from": start_date, "to": end_date, "timeframe": "D"})
+            except Exception:
+                return 0
         
-        if hasattr(response, 'get') and 'data' in response: data = response['data']
-        elif isinstance(response, list): data = response
-        else: data = response
+        if hasattr(response, 'data'):
+            data = response.data
+        elif isinstance(response, dict) and 'data' in response:
+            data = response['data']
+        else:
+            data = response
             
-        df = pd.DataFrame(data)
+        if not data: return 0
+        
+        parsed_data = []
+        for item in data:
+            if isinstance(item, dict): parsed_data.append(item)
+            elif hasattr(item, 'dict'): parsed_data.append(item.dict())
+            elif hasattr(item, '__dict__'): parsed_data.append(vars(item))
+            else: parsed_data.append(item)
+            
+        df = pd.DataFrame(parsed_data)
         if df.empty or len(df) < 10: return 0
             
         close_col = [c for c in df.columns if c.lower() == 'close']
@@ -295,7 +346,7 @@ def get_python_scores(ta):
     if ta["DIF"] > ta["DEA"] and ta["OSC"] > ta["OSC_Y"] and ta["OSC"] > 0: scores["MACD"] = 10; breakdown["MACD"] = "多方動能強勁"
     elif ta["DIF"] > ta["DEA"] and ta["OSC"] > 0: scores["MACD"] = 7; breakdown["MACD"] = "多頭但紅柱縮短"
     elif ta["DIF"] < ta["DEA"] and ta["OSC"] > ta["OSC_Y"]: scores["MACD"] = 3; breakdown["MACD"] = "空頭但有反彈契機"
-    else: scores["MACD"] = 0; breakdown["MACD"] = "空方動能增強"
+    else: scores["MACD"] = 0; breakdown["MACD"] = "死亡交叉且綠柱持續放大，空方動能增強"
     
     # 7. KD(10)
     if ta["K"] > ta["D"] and ta["K"] > ta["K_Y"]: scores["KD"] = 10; breakdown["KD"] = "強勢黃金交叉"
